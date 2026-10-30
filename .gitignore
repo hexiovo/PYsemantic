@@ -10,3 +10,8 @@ dist/
 !.env.example
 assets/bge-small-zh-v1.5/onnx/
 *.part
+/ADVANCED_PARAMETER_PLAN.md
+/ADVANCED_PARAMETER_VALIDATION.md
+/IMPLEMENTATION_PLAN.md
+/PARAMETER_PLAN.md
+/PARAMETER_VALIDATION.md

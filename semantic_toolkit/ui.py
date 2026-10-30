@@ -1,4 +1,4 @@
-"""Chinese four-page desktop interface for the offline semantic toolkit."""
+"""Five-page desktop interface for local Chinese semantic analysis."""
 from __future__ import annotations
 
 from pathlib import Path
@@ -22,23 +22,31 @@ from tkinter import filedialog, messagebox, simpledialog, ttk
 
 from .analysis import AnalysisConfig, AnalysisResult, METHODS, run_analysis
 from .data_io import Corpus, Document, load_corpus, table_columns
+from .environment import (EnvironmentReport, build_install_command, format_environment_report,
+                          inspect_environment, run_install_command)
 from .eta import EtaTracker, STAGE_LABELS, StageEstimate, estimate_stage_plan
-from .resources import resource_path
+from .resources import close_startup_splash, resource_path
 from .result_views import ResultsExplorer
 from .runtime import (RuntimeStore, close_owned_process_tree, corpus_to_dict, load_project_full,
                       owned_process_tree_finished, popen_owned_process, result_cache_load,
                       terminate_owned_process)
+from .settings_io import (presets_document, read_settings_file, settings_document,
+                          validate_settings, write_settings_file)
 
 
-INK = "#27324A"
-CANVAS = "#FCF8F2"
-GREEN = "#20C46A"
-MINT = "#E9FBF1"
-SKY = "#E6F7FB"
-CORAL = "#FFB4AA"
-LEMON = "#F1F9D8"
-LAVENDER = "#E6E6FA"
+INK = "#182B43"
+CANVAS = "#F3F6F9"
+GREEN = "#087F82"
+MINT = "#FFFFFF"
+SKY = "#FFFFFF"
+CORAL = "#C74D4D"
+LEMON = "#FFFFFF"
+LAVENDER = "#EEF2F6"
 WHITE = "#FFFFFF"
+LINE = "#D5DEE8"
+SIDEBAR = "#15283D"
+SIDEBAR_HOVER = "#203850"
+MUTED = "#5C6B7B"
 BODY_FONT = ("Microsoft YaHei UI", 13)
 SMALL_FONT = ("Microsoft YaHei UI", 11)
 TITLE_FONT = ("Microsoft YaHei UI", 23, "bold")
@@ -75,9 +83,44 @@ def set_app_user_model_id() -> None:
     if sys.platform == "win32":
         try:
             import ctypes
-            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("OpenAI.ChineseSemanticToolkit.1")
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("PYsemantic.Desktop.1")
         except Exception:
             pass
+
+
+class CrispComboBox(ctk.CTkComboBox):
+    """CustomTkinter combobox with a single vector-stroke dropdown chevron."""
+
+    _vector_arrow_tag = "pysemantic_vector_dropdown_arrow"
+
+    def _create_bindings(self, sequence: str | None = None) -> None:
+        super()._create_bindings(sequence)
+        if sequence is None:
+            self._canvas.tag_bind(self._vector_arrow_tag, "<Enter>", self._on_enter)
+            self._canvas.tag_bind(self._vector_arrow_tag, "<Leave>", self._on_leave)
+            self._canvas.tag_bind(self._vector_arrow_tag, "<Button-1>", self._clicked)
+
+    def _draw(self, no_color_updates: bool = False) -> None:
+        # The base renderer configures its text glyph by the ``dropdown_arrow``
+        # tag. Remove our prior line before that tag is touched on a redraw.
+        self._canvas.delete(self._vector_arrow_tag)
+        super()._draw(no_color_updates)
+        self._canvas.delete("dropdown_arrow")
+        center_x = self._apply_widget_scaling(self._current_width - self._current_height / 2)
+        center_y = self._apply_widget_scaling(self._current_height / 2)
+        half_width = self._apply_widget_scaling(4.0)
+        half_height = self._apply_widget_scaling(2.5)
+        color = self._text_color_disabled if self._state == "disabled" else self._text_color
+        self._canvas.create_line(
+            center_x - half_width, center_y - half_height,
+            center_x, center_y + half_height,
+            center_x + half_width, center_y - half_height,
+            fill=self._apply_appearance_mode(color),
+            width=self._apply_widget_scaling(1.8),
+            capstyle=tk.ROUND,
+            joinstyle=tk.ROUND,
+            tags=(self._vector_arrow_tag,),
+        )
 
 
 class SemanticApp(ctk.CTk):
@@ -85,8 +128,10 @@ class SemanticApp(ctk.CTk):
     PAGE_TITLES = {"data": ("01  数据准备", "导入文本，检查来源与清理统计"),
                    "methods": ("02  方法设置", "选择语义表示、分词和计算参数"),
                    "results": ("03  结果查看", "浏览指标、主题、近邻与相似度矩阵"),
-                   "help": ("04  帮助与方法", "离线使用说明、来源文献和许可信息"),
-                   "tasks": ("05  任务、日志与项目", "阶段进度、历史记录、已保存项目与方法预设")}
+                   "tasks": ("04  任务、日志与项目", "阶段进度、历史记录、已保存项目与方法预设"),
+                   "help": ("05  帮助与方法", "离线使用说明、来源文献和许可信息")}
+    BGE_DEVICE_LABELS = {"CPU": "cpu", "自动使用可用 GPU": "auto", "CUDA": "cuda", "DirectML": "directml"}
+    BGE_DEVICE_NAMES = {value: key for key, value in BGE_DEVICE_LABELS.items()}
 
     def __init__(self, ui_smoke_dir: str | None = None, runtime_root: str | Path | None = None):
         set_windows_dpi_awareness()
@@ -94,7 +139,7 @@ class SemanticApp(ctk.CTk):
         ctk.set_appearance_mode("Light")
         ctk.set_default_color_theme("blue")
         super().__init__()
-        self.title("中文语义分析工具包")
+        self.title("PYsemantic · 中文语义分析")
         self.configure(fg_color=CANVAS)
         self._center_window()
         self._set_icon()
@@ -109,6 +154,14 @@ class SemanticApp(ctk.CTk):
         self.runtime = RuntimeStore(runtime_root)
         self.current_page = "data"
         self.worker_queue: Queue = Queue()
+        self.environment_queue: Queue = Queue()
+        self.environment_report: EnvironmentReport | None = None
+        self._environment_checking = False
+        self._environment_installing = False
+        self._environment_close_pending = False
+        self._environment_restart_required = False
+        self._environment_cancel_event = Event()
+        self._environment_log: list[str] = []
         self.cancel_event: Event | None = None
         self.worker: Thread | None = None
         self.current_process: subprocess.Popen | None = None
@@ -136,7 +189,10 @@ class SemanticApp(ctk.CTk):
         self._restore_last_settings()
         self.show_page("data")
         self.after(100, self._poll_worker)
+        self.after(100, self._poll_environment_events)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.update_idletasks()
+        self.after(180, close_startup_splash)
         if self.ui_smoke_dir:
             self.after(900, lambda: self._smoke_step(0))
 
@@ -225,80 +281,83 @@ class SemanticApp(ctk.CTk):
     def _build_shell(self) -> None:
         self.grid_columnconfigure(1, weight=1)
         self.grid_rowconfigure(0, weight=1)
-        self.rail = ctk.CTkFrame(self, width=216, corner_radius=0, fg_color=CANVAS)
-        self.rail.grid(row=0, column=0, sticky="nsw", padx=(20, 10), pady=(20, 12))
+        self.rail = ctk.CTkFrame(self, width=232, corner_radius=16, fg_color=SIDEBAR)
+        self.rail.grid(row=0, column=0, sticky="nsw", padx=(18, 12), pady=(18, 12))
         self.rail.grid_propagate(False)
         self.content = ctk.CTkFrame(self, corner_radius=0, fg_color=CANVAS)
-        self.content.grid(row=0, column=1, sticky="nsew", padx=(8, 20), pady=(20, 12))
+        self.content.grid(row=0, column=1, sticky="nsew", padx=(0, 18), pady=(18, 12))
         self.content.grid_rowconfigure(1, weight=1)
         self.content.grid_columnconfigure(0, weight=1)
-        logo_shell = ctk.CTkFrame(self.rail, fg_color=INK, corner_radius=12, height=72)
-        logo_shell.pack(fill="x", pady=(0, 18))
-        logo = ctk.CTkFrame(logo_shell, fg_color=GREEN, border_color=INK, border_width=2, corner_radius=10)
-        logo.pack(fill="both", expand=True, padx=(0, 5), pady=(0, 5))
-        ctk.CTkLabel(logo, text="语义分析", font=("Microsoft YaHei UI", 21, "bold"), text_color=INK).pack(anchor="w", padx=12, pady=(8, 0))
-        ctk.CTkLabel(logo, text="离线桌面工具包", font=SMALL_FONT, text_color=INK).pack(anchor="w", padx=13, pady=(0, 8))
+        logo = ctk.CTkFrame(self.rail, fg_color=SIDEBAR_HOVER, corner_radius=11,
+                            border_color="#30485E", border_width=1)
+        logo.pack(fill="x", padx=13, pady=(15, 18))
+        ctk.CTkLabel(logo, text="PYsemantic", font=("Microsoft YaHei UI", 21, "bold"),
+                     text_color=WHITE).pack(anchor="w", padx=13, pady=(10, 0))
+        ctk.CTkLabel(logo, text="中文语义分析 · 本地工作台", font=SMALL_FONT,
+                     text_color="#C2CEDB").pack(anchor="w", padx=14, pady=(1, 11))
         self.nav_group = ctk.CTkFrame(self.rail, fg_color="transparent")
-        self.nav_group.pack(fill="x")
-        for key, label in [("data", "数据 · 输入与清理"), ("methods", "方法 · 参数设置"),
-                           ("results", "结果 · 矩阵与指标"), ("tasks", "任务 · 日志与项目"),
-                           ("help", "帮助 · 口径与来源")]:
-            holder = ctk.CTkFrame(self.nav_group, fg_color=INK, corner_radius=11, height=70)
-            holder.pack(fill="x", pady=5)
+        self.nav_group.pack(fill="x", padx=11)
+        for key, label in [("data", "01   数据 · 输入与清理"), ("methods", "02   方法 · 参数设置"),
+                           ("results", "03   结果 · 指标与画像"), ("tasks", "04   任务 · 日志与项目"),
+                           ("help", "05   帮助 · 口径与来源")]:
+            holder = ctk.CTkFrame(self.nav_group, fg_color="transparent", corner_radius=10, height=50)
+            holder.pack(fill="x", pady=4)
             holder.pack_propagate(False)
             button = ctk.CTkButton(holder, text=label, command=lambda p=key: self.show_page(p),
-                                   anchor="w", height=64, corner_radius=10, border_width=2,
-                                   border_color=INK, font=("Microsoft YaHei UI", 14, "bold"),
-                                   fg_color=WHITE, hover_color=self.PAGE_COLORS[key], text_color=INK)
-            button.pack(fill="both", expand=True, padx=(0, 5), pady=(0, 5))
+                                   anchor="w", height=46, corner_radius=9, border_width=0,
+                                   font=("Microsoft YaHei UI", 13, "bold"),
+                                   fg_color=SIDEBAR, hover_color=SIDEBAR_HOVER, text_color="#C2CEDB")
+            button.pack(fill="both", expand=True)
             self.nav_buttons[key] = button
             self._all_controls.append(button)
-        ctk.CTkLabel(self.rail, text="数据保留在本机\n启动和分析无需联网", font=SMALL_FONT,
-                     text_color=INK, justify="left").pack(anchor="w", side="bottom", pady=(0, 10))
-        self.title_shell = ctk.CTkFrame(self.content, fg_color=INK, corner_radius=14, height=93)
-        self.title_shell.grid(row=0, column=0, sticky="ew", pady=(0, 14))
+        ctk.CTkLabel(self.rail, text="数据仅保存在本机\n分析与启动无需联网", font=SMALL_FONT,
+                     text_color="#B9C6D4", justify="left").pack(anchor="w", side="bottom", padx=16, pady=(0, 15))
+        self.title_shell = ctk.CTkFrame(self.content, fg_color="transparent", corner_radius=12, height=90)
+        self.title_shell.grid(row=0, column=0, sticky="ew", pady=(0, 12))
         self.title_shell.grid_propagate(False)
-        self.title_card = ctk.CTkFrame(self.title_shell, fg_color=SKY, border_color=INK, border_width=2, corner_radius=12)
-        self.title_card.pack(fill="both", expand=True, padx=(0, 6), pady=(0, 6))
+        self.title_card = ctk.CTkFrame(self.title_shell, fg_color=WHITE, border_color=LINE, border_width=1, corner_radius=11)
+        self.title_card.pack(fill="both", expand=True)
         self.page_title = ctk.CTkLabel(self.title_card, text="", font=TITLE_FONT, text_color=INK, anchor="w")
-        self.page_title.pack(anchor="w", padx=17, pady=(12, 0))
-        self.page_subtitle = ctk.CTkLabel(self.title_card, text="", font=SMALL_FONT, text_color=INK, anchor="w")
-        self.page_subtitle.pack(anchor="w", padx=19, pady=(1, 10))
+        self.page_title.pack(anchor="w", padx=18, pady=(12, 0))
+        self.page_subtitle = ctk.CTkLabel(self.title_card, text="", font=SMALL_FONT, text_color=MUTED, anchor="w")
+        self.page_subtitle.pack(anchor="w", padx=20, pady=(1, 10))
         self.page_host = ctk.CTkFrame(self.content, fg_color="transparent")
         self.page_host.grid(row=1, column=0, sticky="nsew")
         self.page_host.grid_rowconfigure(0, weight=1)
         self.page_host.grid_columnconfigure(0, weight=1)
-        self.status_shell = ctk.CTkFrame(self, fg_color=INK, corner_radius=10, height=72)
-        self.status_shell.grid(row=1, column=0, columnspan=2, sticky="ew", padx=20, pady=(0, 14))
+        self.status_shell = ctk.CTkFrame(self, fg_color=WHITE, border_color=LINE, border_width=1, corner_radius=10)
+        self.status_shell.grid(row=1, column=0, columnspan=2, sticky="ew", padx=18, pady=(0, 12))
         self.status_shell.grid_columnconfigure(0, weight=1)
         self.status_label = ctk.CTkLabel(self.status_shell, text="就绪。可先导入文本，也可在帮助页查看口径。",
-                                         text_color=WHITE, anchor="w", justify="left", wraplength=900, font=SMALL_FONT)
-        self.status_label.grid(row=0, column=0, sticky="ew", padx=13, pady=7)
-        self.progress = ctk.CTkProgressBar(self.status_shell, width=150, height=12, progress_color=GREEN)
+                                         text_color=INK, anchor="w", justify="left", wraplength=900, font=SMALL_FONT)
+        self.status_label.grid(row=0, column=0, sticky="ew", padx=13, pady=8)
+        self.progress = ctk.CTkProgressBar(self.status_shell, width=150, height=10, progress_color=GREEN,
+                                           fg_color="#E6EBF0")
         self.progress.set(0)
         self.progress.grid(row=0, column=1, padx=10, pady=10)
-        self.cancel_button = ctk.CTkButton(self.status_shell, text="取消", width=70, height=30, fg_color=CORAL,
-                                           hover_color="#f29b8e", text_color=INK, border_color=INK, border_width=1,
+        self.cancel_button = ctk.CTkButton(self.status_shell, text="取消", width=70, height=32, fg_color=CORAL,
+                                           hover_color="#A93F3F", text_color=WHITE, border_color=CORAL, border_width=1,
                                            command=self.cancel_work, state="disabled")
         self.cancel_button.grid(row=0, column=2, padx=(4, 9), pady=7)
         self._all_controls.append(self.cancel_button)
 
     def _scroll_page(self, key: str, color: str) -> ctk.CTkScrollableFrame:
-        page = ctk.CTkScrollableFrame(self.page_host, fg_color=color, corner_radius=12,
-                                     border_color=INK, border_width=2, scrollbar_button_color=INK,
-                                     scrollbar_button_hover_color="#46516a")
+        page = ctk.CTkScrollableFrame(self.page_host, fg_color=CANVAS, corner_radius=10,
+                                     border_color=CANVAS, border_width=0, scrollbar_button_color="#B8C4D1",
+                                     scrollbar_button_hover_color="#8393A4")
         page.grid(row=0, column=0, sticky="nsew")
         page.grid_columnconfigure(0, weight=1)
         self.page_widgets[key] = page
         return page
 
     def _card(self, parent: Any, fill: str = WHITE, *, padx: int = 14, pady: int = 10) -> ctk.CTkFrame:
-        frame = ctk.CTkFrame(parent, fg_color=fill, border_color=INK, border_width=2, corner_radius=12)
+        frame = ctk.CTkFrame(parent, fg_color=fill, border_color=LINE, border_width=1, corner_radius=10)
         frame.pack(fill="x", padx=padx, pady=pady)
         return frame
 
     def _label(self, parent: Any, text: str, **kwargs: Any) -> ctk.CTkLabel:
-        return ctk.CTkLabel(parent, text=text, font=kwargs.pop("font", BODY_FONT), text_color=INK, **kwargs)
+        return ctk.CTkLabel(parent, text=text, font=kwargs.pop("font", BODY_FONT),
+                            text_color=kwargs.pop("text_color", INK), **kwargs)
 
     def _register_control(self, widget: Any) -> Any:
         self._all_controls.append(widget)
@@ -306,31 +365,34 @@ class SemanticApp(ctk.CTk):
 
     def _entry(self, parent: Any, var: Any, *, width: int = 130, placeholder: str = "") -> ctk.CTkEntry:
         return self._register_control(ctk.CTkEntry(parent, textvariable=var, width=width, height=36, fg_color=WHITE,
-                                           border_color=INK, border_width=2, corner_radius=8,
+                                           border_color=LINE, border_width=1, corner_radius=8,
                                            placeholder_text=placeholder, text_color=INK, font=BODY_FONT))
 
-    def _combo(self, parent: Any, var: Any, values: list[str], *, width: int = 190) -> ctk.CTkComboBox:
-        return self._register_control(ctk.CTkComboBox(parent, variable=var, values=values, width=width, height=36,
-                                             fg_color=WHITE, border_color=INK, border_width=2,
-                                             button_color=LAVENDER, button_hover_color=SKY,
+    def _combo(self, parent: Any, var: Any, values: list[str], *, width: int = 190) -> CrispComboBox:
+        return self._register_control(CrispComboBox(parent, variable=var, values=values, width=width, height=36,
+                                             fg_color=WHITE, border_color=LINE, border_width=1,
+                                             button_color=WHITE, button_hover_color=LAVENDER,
                                              text_color=INK, dropdown_fg_color=WHITE,
                                              dropdown_text_color=INK, font=BODY_FONT))
 
     def _button(self, parent: Any, text: str, command: Callable[[], None], *, primary: bool = False,
                 width: int = 150) -> ctk.CTkButton:
-        color = GREEN if primary else LAVENDER
-        holder = ctk.CTkFrame(parent, fg_color=INK, corner_radius=9, width=width, height=44)
+        color = GREEN if primary else WHITE
+        text_color = WHITE if primary else INK
+        border_color = GREEN if primary else LINE
+        hover_color = "#159294" if primary else LAVENDER
+        holder = ctk.CTkFrame(parent, fg_color="transparent", corner_radius=9, width=width, height=42)
         holder.pack_propagate(False)
-        button = ctk.CTkButton(holder, text=text, command=command, height=39, corner_radius=8,
-                               border_width=2, border_color=INK, fg_color=color, hover_color=SKY,
-                               text_color=INK, font=("Microsoft YaHei UI", 13, "bold"))
-        button.pack(fill="both", expand=True, padx=(0, 5), pady=(0, 5))
+        button = ctk.CTkButton(holder, text=text, command=command, height=38, corner_radius=8,
+                               border_width=1, border_color=border_color, fg_color=color, hover_color=hover_color,
+                               text_color=text_color, font=("Microsoft YaHei UI", 13, "bold"))
+        button.pack(fill="both", expand=True)
         self._register_control(button)
         return holder
 
     def _add_page_title(self, key: str) -> None:
         title, subtitle = self.PAGE_TITLES[key]
-        self.title_card.configure(fg_color=self.PAGE_COLORS[key])
+        self.title_card.configure(fg_color=WHITE)
         self.page_title.configure(text=title)
         self.page_subtitle.configure(text=subtitle)
 
@@ -343,15 +405,17 @@ class SemanticApp(ctk.CTk):
         self.current_page = key
         self._add_page_title(key)
         for name, button in self.nav_buttons.items():
-            button.configure(fg_color=self.PAGE_COLORS[name] if name == key else WHITE,
-                             border_width=3 if name == key else 2)
+            active = name == key
+            button.configure(fg_color=GREEN if active else SIDEBAR,
+                             hover_color="#159294" if active else SIDEBAR_HOVER,
+                             text_color=WHITE if active else "#C2CEDB", border_width=0)
 
     def _build_data_page(self) -> None:
         page = self._scroll_page("data", self.PAGE_COLORS["data"])
         card = self._card(page, SKY, pady=8)
         self._label(card, "粘贴文本", font=SECTION_FONT).pack(anchor="w", padx=12, pady=(10, 5))
         self.paste_box = self._register_control(ctk.CTkTextbox(card, height=115, fg_color=WHITE, text_color=INK,
-                                                       border_color=INK, border_width=2, corner_radius=8,
+                                                       border_color=LINE, border_width=1, corner_radius=8,
                                                        font=BODY_FONT, wrap="word"))
         self.paste_box.pack(fill="x", padx=12, pady=(0, 8))
         paste_row = ctk.CTkFrame(card, fg_color="transparent")
@@ -383,8 +447,8 @@ class SemanticApp(ctk.CTk):
         self.id_column_combo.grid(row=0, column=3, padx=(0, 18), pady=5, sticky="w")
         self.dedupe_var = tk.BooleanVar(value=False)
         self.dedupe_check = self._register_control(ctk.CTkCheckBox(columns, text="按空白归一后的完全相同文本去重", variable=self.dedupe_var,
-                                                           text_color=INK, fg_color=GREEN, hover_color="#13a955",
-                                                           border_color=INK, font=SMALL_FONT))
+                                                           text_color=INK, fg_color=GREEN, hover_color="#159294",
+                                                           border_color=LINE, font=SMALL_FONT))
         self.dedupe_check.grid(row=0, column=4, padx=5, pady=5, sticky="w")
 
         read_row = ctk.CTkFrame(file_card, fg_color="transparent")
@@ -400,6 +464,35 @@ class SemanticApp(ctk.CTk):
 
     def _build_method_page(self) -> None:
         page = self._scroll_page("methods", self.PAGE_COLORS["methods"])
+        acceleration_card = self._card(page, LAVENDER, pady=7)
+        self._label(acceleration_card, "计算加速", font=SECTION_FONT).pack(anchor="w", padx=12, pady=(8, 3))
+        accelerator_row = ctk.CTkFrame(acceleration_card, fg_color="transparent")
+        accelerator_row.pack(fill="x", padx=12, pady=(0, 4))
+        self.parallel_enabled_var = tk.BooleanVar(value=False)
+        self.parallel_enabled_check = self._register_control(ctk.CTkCheckBox(
+            accelerator_row, text="启用 CPU 并行加速", variable=self.parallel_enabled_var,
+            command=self._toggle_parallel_controls, text_color=INK, fg_color=GREEN,
+            hover_color="#159294", border_color=LINE, font=SMALL_FONT,
+        ))
+        self.parallel_enabled_check.pack(side="left", padx=(0, 15))
+        self._label(accelerator_row, "CPU 工作线程（1–32）", font=SMALL_FONT).pack(side="left", padx=(0, 6))
+        self.cpu_workers_var = tk.StringVar(value="4")
+        self.cpu_workers_entry = self._entry(accelerator_row, self.cpu_workers_var, width=74)
+        self.cpu_workers_entry.pack(side="left", padx=(0, 18))
+        self._label(accelerator_row, "BGE ONNX", font=SMALL_FONT).pack(side="left", padx=(0, 7))
+        self.bge_device_var = tk.StringVar(value="CPU")
+        self.bge_device_combo = self._combo(
+            accelerator_row, self.bge_device_var, list(self.BGE_DEVICE_LABELS), width=210,
+        )
+        self.bge_device_combo.pack(side="left")
+        self.bge_device_combo.configure(command=lambda _value: self._render_environment_report())
+        self._label(
+            acceleration_card,
+            "并行默认关闭；开启后按线程数控制计算并行。GPU 设置只影响 BGE ONNX：自动模式在可用 GPU provider 缺失时回退 CPU；显式 CUDA / DirectML 模式要求对应运行时与设备已配置。CUDA 与 DirectML 发行包互斥，需按官方说明选择一个版本并重启。",
+            font=SMALL_FONT, anchor="w", justify="left", wraplength=900, text_color=MUTED,
+        ).pack(fill="x", padx=12, pady=(0, 9))
+        self._toggle_parallel_controls()
+
         card = self._card(page, MINT, pady=8)
         self._label(card, "文档表示方法", font=SECTION_FONT).pack(anchor="w", padx=12, pady=(10, 6))
         row = ctk.CTkFrame(card, fg_color="transparent")
@@ -417,6 +510,14 @@ class SemanticApp(ctk.CTk):
         self.stopwords_combo = self._combo(row, self.stopwords_var, ["无", "保守内置", "标准内置", "自定义文件"], width=160)
         self.stopwords_combo.pack(side="left")
 
+        settings_row = ctk.CTkFrame(card, fg_color="transparent")
+        settings_row.pack(fill="x", padx=12, pady=(7, 3))
+        self._label(settings_row, "参数文件").pack(side="left", padx=(0, 8))
+        self._button(settings_row, "导入 JSON", self._import_settings_clicked, width=126).pack(side="left", padx=(0, 8))
+        self._button(settings_row, "导出 JSON", self._export_settings_clicked, width=126).pack(side="left", padx=(0, 10))
+        self._label(settings_row, "仅导入设置和来源路径，不会读取文本文件。", font=SMALL_FONT,
+                    text_color=MUTED).pack(side="left")
+
         resource_row = ctk.CTkFrame(card, fg_color="transparent")
         resource_row.pack(fill="x", padx=12, pady=(8, 2))
         self.user_dictionary_var = tk.StringVar(value="")
@@ -428,7 +529,7 @@ class SemanticApp(ctk.CTk):
         self.user_dictionary_entry = self._entry(dictionary_row, self.user_dictionary_var, width=360, placeholder="可选 UTF-8 词典路径")
         self.user_dictionary_entry.pack(side="left", fill="x", expand=True, padx=(0, 6))
         self.user_dict_button = self._register_control(ctk.CTkButton(dictionary_row, text="浏览…", width=72, height=34, command=self._browse_user_dictionary,
-                                                               fg_color=LAVENDER, hover_color=SKY, border_color=INK, border_width=1, text_color=INK))
+                                                               fg_color=LAVENDER, hover_color=SKY, border_color=LINE, border_width=1, text_color=INK))
         self.user_dict_button.pack(side="left")
         stopword_row = ctk.CTkFrame(resource_row, fg_color="transparent")
         stopword_row.pack(fill="x", pady=(0, 4))
@@ -436,7 +537,7 @@ class SemanticApp(ctk.CTk):
         self.custom_stopwords_entry = self._entry(stopword_row, self.custom_stopwords_var, width=320, placeholder="每行一个词")
         self.custom_stopwords_entry.pack(side="left", fill="x", expand=True, padx=(0, 6))
         self.custom_stopwords_button = self._register_control(ctk.CTkButton(stopword_row, text="浏览…", width=72, height=34, command=self._browse_stopwords,
-                                                                     fg_color=LAVENDER, hover_color=SKY, border_color=INK, border_width=1, text_color=INK))
+                                                                     fg_color=LAVENDER, hover_color=SKY, border_color=LINE, border_width=1, text_color=INK))
         self.custom_stopwords_button.pack(side="left")
 
         params = ctk.CTkFrame(card, fg_color="transparent")
@@ -465,22 +566,22 @@ class SemanticApp(ctk.CTk):
         self.word2vec_entry = self._entry(self.word2vec_row, self.word2vec_path_var, width=590, placeholder="仅在选择 word2vec 方法时需要；二进制 .bin 不支持")
         self.word2vec_entry.pack(side="left", fill="x", expand=True, padx=(0, 6))
         self.word2vec_button = self._register_control(ctk.CTkButton(self.word2vec_row, text="浏览…", width=72, height=34, command=self._browse_word2vec,
-                                                            fg_color=LAVENDER, hover_color=SKY, border_color=INK, border_width=1, text_color=INK))
+                                                            fg_color=LAVENDER, hover_color=SKY, border_color=LINE, border_width=1, text_color=INK))
         self.word2vec_button.pack(side="left")
         self.word2vec_tfidf_var = tk.BooleanVar(value=True)
         self.word2vec_check = self._register_control(ctk.CTkCheckBox(card, text="word2vec 词向量按文档 TF-IDF 权重平均", variable=self.word2vec_tfidf_var,
-                                                             text_color=INK, fg_color=GREEN, hover_color="#13a955", border_color=INK,
+                                                             text_color=INK, fg_color=GREEN, hover_color="#159294", border_color=LINE,
                                                              font=SMALL_FONT))
         self.word2vec_check.pack(anchor="w", padx=14, pady=(5, 8))
         self.similarity_var = tk.BooleanVar(value=True)
         self.similarity_check = self._register_control(ctk.CTkCheckBox(card, text=f"计算完整相似度矩阵（最多 {1500:,} 篇文档；超出时仍计算分块近邻）",
                                                                variable=self.similarity_var, text_color=INK, fg_color=GREEN,
-                                                               hover_color="#13a955", border_color=INK, font=SMALL_FONT))
+                                                               hover_color="#159294", border_color=LINE, font=SMALL_FONT))
         self.similarity_check.pack(anchor="w", padx=14, pady=(0, 8))
         self.compute_clusters_var = tk.BooleanVar(value=True)
         self.clustering_check = self._register_control(ctk.CTkCheckBox(
             card, text="计算 KMeans 聚类与轮廓系数（关闭后仍计算主题与近邻）", variable=self.compute_clusters_var,
-            text_color=INK, fg_color=GREEN, hover_color="#13a955", border_color=INK, font=SMALL_FONT))
+            text_color=INK, fg_color=GREEN, hover_color="#159294", border_color=LINE, font=SMALL_FONT))
         self.clustering_check.pack(anchor="w", padx=14, pady=(0, 8))
         self.extra_bool_vars: dict[str, tk.BooleanVar] = {}
         for name, label in [("compute_neighbors", "计算近邻（关闭后跳过所有近邻文档对计算）"),
@@ -488,7 +589,7 @@ class SemanticApp(ctk.CTk):
             variable = tk.BooleanVar(value=True)
             self.extra_bool_vars[name] = variable
             checkbox = self._register_control(ctk.CTkCheckBox(card, text=label, variable=variable,
-                text_color=INK, fg_color=GREEN, hover_color="#13a955", border_color=INK, font=SMALL_FONT))
+                text_color=INK, fg_color=GREEN, hover_color="#159294", border_color=LINE, font=SMALL_FONT))
             checkbox.pack(anchor="w", padx=14, pady=(0, 8))
         self.method_hint = self._label(card, "BGE 使用内置本地模型，原文编码、CLS 池化、L2 归一化；启动无需联网。", font=SMALL_FONT,
                                        anchor="w", justify="left", wraplength=860)
@@ -509,7 +610,7 @@ class SemanticApp(ctk.CTk):
             self.batch_vars[method] = var
             checkbox = self._register_control(ctk.CTkCheckBox(batch_grid, text=label, variable=var,
                                                                text_color=INK, fg_color=GREEN,
-                                                               hover_color="#13a955", border_color=INK,
+                                                               hover_color="#159294", border_color=LINE,
                                                                font=SMALL_FONT))
             checkbox.grid(row=index // 4, column=index % 4, sticky="w", padx=8, pady=4)
         for col in range(4):
@@ -575,7 +676,7 @@ class SemanticApp(ctk.CTk):
             variable = tk.BooleanVar(value=getattr(defaults, name))
             self.extra_bool_vars[name] = variable
             checkbox = self._register_control(ctk.CTkCheckBox(host, text=label, variable=variable,
-                text_color=INK, fg_color=GREEN, hover_color="#13a955", border_color=INK, font=SMALL_FONT))
+                text_color=INK, fg_color=GREEN, hover_color="#159294", border_color=LINE, font=SMALL_FONT))
             checkbox.pack(anchor="w", padx=14, pady=(0, 8))
         parameter_card("主题与聚类展示", [("topic_top_words", "主题词表每主题词数（1–100）"),
             ("profile_top_words", "画像关键词数量（1–100）"), ("representative_count", "每组代表文本数（1–50）")],
@@ -608,8 +709,8 @@ class SemanticApp(ctk.CTk):
         export_row = result_select_row
         self.xlsx_var = tk.BooleanVar(value=False)
         self.xlsx_check = self._register_control(ctk.CTkCheckBox(export_row, text="同时生成 XLSX", variable=self.xlsx_var,
-                                                          text_color=INK, fg_color=GREEN, hover_color="#13a955",
-                                                          border_color=INK, font=SMALL_FONT))
+                                                          text_color=INK, fg_color=GREEN, hover_color="#159294",
+                                                          border_color=LINE, font=SMALL_FONT))
         self.xlsx_check.pack(side="right", padx=(8, 12))
         self.export_button = self._button(export_row, "导出选定结果", self._export_clicked, primary=True, width=130)
         self.export_button.pack(side="right")
@@ -620,15 +721,15 @@ class SemanticApp(ctk.CTk):
 
         self.results_tab = ctk.CTkTabview(card, fg_color=WHITE, segmented_button_fg_color=LAVENDER,
                                            segmented_button_selected_color=GREEN,
-                                           segmented_button_selected_hover_color="#13a955",
+                                           segmented_button_selected_hover_color="#159294",
                                            segmented_button_unselected_color=WHITE,
                                            segmented_button_unselected_hover_color=SKY,
-                                           text_color=INK, border_color=INK, border_width=2, corner_radius=10)
+                                           text_color=INK, border_color=LINE, border_width=1, corner_radius=10)
         self.results_tab.pack(fill="both", expand=True, padx=11, pady=(4, 11))
         for name in ["概览", "文档指标", "词频", "近邻", "主题与聚类", "相似度热图"]:
             self.results_tab.add(name)
         self.overview_box = ctk.CTkTextbox(self.results_tab.tab("概览"), height=360, fg_color=WHITE, text_color=INK,
-                                           border_color=INK, border_width=1, font=BODY_FONT, wrap="word")
+                                           border_color=LINE, border_width=1, font=BODY_FONT, wrap="word")
         self.overview_box.pack(fill="both", expand=True, padx=7, pady=7)
         self._set_readonly_text(self.overview_box, "尚未运行分析。\n\n先在“数据”页导入文本，再到“方法”页选择算法并开始计算。")
         self.explorer = ResultsExplorer(self, self.results_tab, ink=INK, white=WHITE,
@@ -645,7 +746,7 @@ class SemanticApp(ctk.CTk):
         except Exception:
             pass
         style.configure("Toolkit.Treeview", background=WHITE, fieldbackground=WHITE, foreground=INK,
-                        rowheight=28, bordercolor=INK, borderwidth=1, font=("Microsoft YaHei UI", 10))
+                        rowheight=28, bordercolor=LINE, borderwidth=1, font=("Microsoft YaHei UI", 10))
         style.configure("Toolkit.Treeview.Heading", background=LAVENDER, foreground=INK,
                         font=("Microsoft YaHei UI", 10, "bold"), relief="flat")
         style.map("Toolkit.Treeview", background=[("selected", GREEN)], foreground=[("selected", INK)])
@@ -655,8 +756,12 @@ class SemanticApp(ctk.CTk):
         page = self._scroll_page("help", self.PAGE_COLORS["help"])
         card = self._card(page, WHITE, pady=8)
         self._label(card, "本地使用", font=SECTION_FONT).pack(anchor="w", padx=12, pady=(10, 4))
-        self._label(card, "程序启动不请求网络；默认 BGE 模型已随程序打包。模型资源、分词器、参数和来源保存在离线导出中。大规模结果以 NPZ 保存，界面表格和热图只显示有限预览。完整相似度矩阵最多 1,500 篇文档；超过时保留分块近邻。",
+        self._label(card, "程序启动不请求网络；默认 BGE 模型已随程序打包。导出结果会记录模型信息、分词设置、计算参数和来源。大规模结果以 NPZ 保存，界面表格和热图只显示有限预览。完整相似度矩阵最多 1,500 篇文档；超过时保留分块近邻。",
                     font=SMALL_FONT, anchor="w", justify="left", wraplength=850).pack(fill="x", padx=12, pady=(0, 10))
+        guide_actions = ctk.CTkFrame(card, fg_color="transparent")
+        guide_actions.pack(fill="x", padx=12, pady=(0, 9))
+        self._button(guide_actions, "打开操作指南 PDF", self._open_user_guide, primary=True, width=180).pack(side="left", padx=(0, 8))
+        self._button(guide_actions, "另存操作指南", self._save_user_guide, width=150).pack(side="left")
         links = self._card(page, LAVENDER, pady=8)
         self._label(links, "帮助资料", font=SECTION_FONT).pack(anchor="w", padx=12, pady=(10, 5))
         buttons = ctk.CTkFrame(links, fg_color="transparent")
@@ -673,8 +778,78 @@ class SemanticApp(ctk.CTk):
         self._label(limits, "阶段和全任务剩余时间会先按方法、规模与参数给出初始估计，再按本次工作量或成功历史校准；阶段参考范围是工程参考，不是统计置信区间。拟合等无法回调的步骤会保留真实阶段，超出初始时长后持续更新剩余估计。",
                     font=SMALL_FONT, anchor="w", justify="left", wraplength=850).pack(fill="x", padx=12, pady=(0, 10))
 
+    def _open_user_guide(self) -> None:
+        path = resource_path(Path("docs") / "PYsemantic操作指南.pdf")
+        if not path.is_file():
+            messagebox.showerror("操作指南缺失", "程序资源中找不到操作指南 PDF。请重新下载完整程序包。", parent=self)
+            return
+        try:
+            if sys.platform == "win32":
+                os.startfile(str(path))
+            else:
+                webbrowser.open(path.resolve().as_uri())
+        except OSError as exc:
+            messagebox.showerror("无法打开操作指南", f"请检查 PDF 阅读器是否可用。\n{exc}", parent=self)
+
+    def _save_user_guide(self) -> None:
+        source = resource_path(Path("docs") / "PYsemantic操作指南.pdf")
+        if not source.is_file():
+            messagebox.showerror("操作指南缺失", "程序资源中找不到操作指南 PDF。请重新下载完整程序包。", parent=self)
+            return
+        destination = filedialog.asksaveasfilename(
+            parent=self, title="另存 PYsemantic 操作指南", defaultextension=".pdf",
+            initialfile="PYsemantic-操作指南.pdf", filetypes=[("PDF 文件", "*.pdf")],
+        )
+        if not destination:
+            return
+        try:
+            shutil.copy2(source, destination)
+        except OSError as exc:
+            messagebox.showerror("保存操作指南失败", f"请选择可写入的位置后重试。\n{exc}", parent=self)
+            return
+        self._set_status(f"操作指南已保存：{destination}")
+
     def _build_tasks_page(self) -> None:
         page = self._scroll_page("tasks", self.PAGE_COLORS["tasks"])
+        environment_card = self._card(page, LAVENDER, pady=7)
+        self._label(environment_card, "运行环境与计算加速", font=SECTION_FONT).pack(anchor="w", padx=12, pady=(8, 3))
+        self._label(
+            environment_card,
+            "检查运行包导入状态、锁定版本、本地 BGE 模型、CPU 核心数和 ONNX Runtime providers。安装只修复源码环境中的应用运行依赖；打包 EXE 的内置 Python 不可由应用内修改。",
+            font=SMALL_FONT, anchor="w", justify="left", wraplength=900,
+        ).pack(fill="x", padx=12, pady=(0, 6))
+        environment_actions = ctk.CTkFrame(environment_card, fg_color="transparent")
+        environment_actions.pack(fill="x", padx=10, pady=(0, 5))
+        self.environment_check_button = self._button(
+            environment_actions, "检查环境", self._start_environment_check, width=125,
+        )
+        self.environment_check_button.pack(side="left", padx=(0, 7))
+        self.environment_install_button = self._button(
+            environment_actions, "一键安装缺失依赖", self._install_missing_dependencies, primary=True, width=190,
+        )
+        self.environment_install_button.pack(side="left", padx=(0, 7))
+        self.environment_cancel_button = self._button(
+            environment_actions, "取消安装", self._cancel_environment_install, width=120,
+        )
+        self.environment_cancel_button.pack(side="left", padx=(0, 7))
+        self._button(environment_actions, "CUDA 说明", lambda: webbrowser.open(
+            "https://onnxruntime.ai/docs/execution-providers/CUDA-ExecutionProvider.html"), width=120,
+        ).pack(side="left", padx=(0, 7))
+        self._button(environment_actions, "DirectML 说明", lambda: webbrowser.open(
+            "https://onnxruntime.ai/docs/execution-providers/DirectML-ExecutionProvider.html"), width=140,
+        ).pack(side="left")
+        self.environment_status_label = self._label(environment_card, "正在等待环境检查…", font=SMALL_FONT,
+                                                    anchor="w", justify="left")
+        self.environment_status_label.pack(fill="x", padx=12, pady=(0, 4))
+        self.environment_details = self._register_control(ctk.CTkTextbox(
+            environment_card, height=146, fg_color=WHITE, text_color=INK, border_color=LINE,
+            border_width=1, font=SMALL_FONT, wrap="word",
+        ))
+        self.environment_details.pack(fill="x", padx=12, pady=(0, 9))
+        self._set_readonly_text(self.environment_details, "环境检查将在后台进行，界面保持可用。")
+
+        self._refresh_environment_button_states()
+
         log_card = self._card(page, WHITE, pady=7)
         self._label(log_card, "运行日志", font=SECTION_FONT).pack(anchor="w", padx=12, pady=(8, 3))
         self._label(log_card, "日志保存在本机，按大小轮换；普通运行日志不记录粘贴文本。可筛选、复制或导出完整内容。",
@@ -713,12 +888,14 @@ class SemanticApp(ctk.CTk):
         preset_row.pack(fill="x", padx=10, pady=(0, 7))
         self.preset_name_var = tk.StringVar(value="")
         self.preset_picker_var = tk.StringVar(value="")
-        self._entry(preset_row, self.preset_name_var, width=180, placeholder="命名预设").pack(side="left", padx=(0, 8))
-        self.preset_combo = self._combo(preset_row, self.preset_picker_var, [], width=190)
+        self._entry(preset_row, self.preset_name_var, width=150, placeholder="命名预设").pack(side="left", padx=(0, 7))
+        self.preset_combo = self._combo(preset_row, self.preset_picker_var, [], width=170)
         self.preset_combo.pack(side="left", padx=(0, 8))
-        self._button(preset_row, "保存预设", self._save_preset_clicked, width=135).pack(side="left", padx=(0, 8))
-        self._button(preset_row, "加载预设", self._load_preset_clicked, width=135).pack(side="left", padx=(0, 8))
-        self._button(preset_row, "删除预设", self._delete_preset_clicked, width=135).pack(side="left")
+        self._button(preset_row, "保存预设", self._save_preset_clicked, width=110).pack(side="left", padx=(0, 7))
+        self._button(preset_row, "加载预设", self._load_preset_clicked, width=110).pack(side="left", padx=(0, 7))
+        self._button(preset_row, "删除预设", self._delete_preset_clicked, width=110).pack(side="left", padx=(0, 7))
+        self._button(preset_row, "导入预设", self._import_preset_clicked, width=112).pack(side="left", padx=(0, 7))
+        self._button(preset_row, "导出预设", self._export_presets_clicked, width=112).pack(side="left")
 
         compare_card = self._card(page, MINT, pady=7)
         compare_row = ctk.CTkFrame(compare_card, fg_color="transparent")
@@ -735,6 +912,179 @@ class SemanticApp(ctk.CTk):
         self.comparison_tree.pack(fill="x", padx=10, pady=(0, 8))
         self._refresh_task_history()
         self._refresh_preset_names()
+
+    def _selected_bge_device(self) -> str:
+        return self.BGE_DEVICE_LABELS.get(self.bge_device_var.get(), "cpu")
+
+    def _toggle_parallel_controls(self) -> None:
+        if not hasattr(self, "cpu_workers_entry"):
+            return
+        enabled = bool(self.parallel_enabled_var.get()) and not self.busy
+        self.cpu_workers_entry.configure(state="normal" if enabled else "disabled")
+
+    def _refresh_environment_button_states(self) -> None:
+        if not hasattr(self, "environment_check_button"):
+            return
+        check_button = self.environment_check_button.winfo_children()[0]
+        install_button = self.environment_install_button.winfo_children()[0]
+        cancel_button = self.environment_cancel_button.winfo_children()[0]
+        check_button.configure(state="disabled" if self._environment_checking or self._environment_installing else "normal")
+        report = self.environment_report
+        install_ready = bool(report and report.repairable_dependencies and not report.frozen)
+        install_button.configure(state="normal" if install_ready and not self.busy and not self._environment_installing else "disabled")
+        cancel_button.configure(state="normal" if self._environment_installing else "disabled")
+        self.parallel_enabled_check.configure(state="disabled" if self.busy else "normal")
+        self.bge_device_combo.configure(state="disabled" if self.busy else "normal")
+        self._toggle_parallel_controls()
+
+    def _render_environment_report(self) -> None:
+        if self.environment_report is None:
+            return
+        report = self.environment_report
+        self._set_readonly_text(self.environment_details, format_environment_report(report))
+        if report.missing_dependencies:
+            summary = f"发现 {len(report.missing_dependencies)} 个需要安装或校正版本的依赖。"
+        else:
+            summary = "运行依赖齐全。"
+        if not report.model_available:
+            summary += " BGE 模型资源缺失。"
+        selected = self._selected_bge_device()
+        if selected == "cuda" and "CUDAExecutionProvider" not in report.onnx_providers:
+            summary += " 当前未检测到 CUDAExecutionProvider。"
+        elif selected == "directml" and "DmlExecutionProvider" not in report.onnx_providers:
+            summary += " 当前未检测到 DmlExecutionProvider。"
+        elif selected == "auto" and not any(
+            provider in report.onnx_providers for provider in ("CUDAExecutionProvider", "DmlExecutionProvider")
+        ):
+            summary += " 当前未检测到可用 GPU provider，BGE 将按自动模式回退 CPU。"
+        if report.frozen:
+            summary += " 打包 EXE 不支持应用内修改内置依赖。"
+        if self._environment_restart_required:
+            summary += " 安装已完成；重启程序后使用新依赖。"
+        self.environment_status_label.configure(text=summary)
+
+    def _start_environment_check(self) -> None:
+        if self._environment_checking or self._environment_installing:
+            return
+        self._environment_checking = True
+        self.environment_status_label.configure(text="正在后台检查依赖、模型和 ONNX Runtime providers…")
+        self._refresh_environment_button_states()
+
+        def check() -> None:
+            try:
+                self.environment_queue.put(("environment-check", inspect_environment()))
+            except Exception as exc:
+                self.environment_queue.put(("environment-error", f"{type(exc).__name__}: {exc}"))
+
+        Thread(target=check, name="environment-check", daemon=True).start()
+
+    def _install_missing_dependencies(self) -> None:
+        if self.busy:
+            messagebox.showinfo("任务正在执行", "请等当前任务结束后再安装运行依赖。", parent=self)
+            return
+        if self._environment_checking or self._environment_installing:
+            return
+        report = self.environment_report
+        if report is None:
+            self._start_environment_check()
+            return
+        self._environment_installing = True
+        self._environment_cancel_event.clear()
+        self._environment_log.clear()
+        self.environment_status_label.configure(text="正在准备修复清单…")
+        for key, page in self.page_widgets.items():
+            if key != "tasks":
+                self._set_widget_tree_state(page, True)
+        for key, button in self.nav_buttons.items():
+            button.configure(state="normal" if key == "tasks" else "disabled")
+        self._refresh_environment_button_states()
+
+        def install() -> None:
+            try:
+                command = build_install_command(report.repairable_dependencies, frozen=report.frozen)
+                if not command:
+                    self.environment_queue.put(("environment-install-finished", (0, False, "没有需要安装的依赖。")))
+                    return
+                code, cancelled = run_install_command(
+                    command,
+                    cancel_event=self._environment_cancel_event,
+                    on_output=lambda line: self.environment_queue.put(("environment-output", line)),
+                )
+                self.environment_queue.put(("environment-install-finished", (code, cancelled, "")))
+            except Exception as exc:
+                self.environment_queue.put(("environment-error", f"安装失败：{type(exc).__name__}: {exc}"))
+
+        Thread(target=install, name="environment-install", daemon=True).start()
+
+    def _cancel_environment_install(self) -> None:
+        if self._environment_installing:
+            self._environment_cancel_event.set()
+            self.environment_status_label.configure(text="正在取消 pip 安装…")
+
+    def _poll_environment_events(self) -> None:
+        try:
+            while True:
+                kind, payload = self.environment_queue.get_nowait()
+                if kind == "environment-check":
+                    self._environment_checking = False
+                    self.environment_report = payload
+                    self._render_environment_report()
+                    self._refresh_environment_button_states()
+                elif kind == "environment-output":
+                    self._environment_log.append(str(payload))
+                    self._environment_log = self._environment_log[-40:]
+                    if self.environment_report is not None:
+                        details = format_environment_report(self.environment_report)
+                        self._set_readonly_text(self.environment_details, details + "\n\n安装输出（最近 40 行）：\n" + "\n".join(self._environment_log))
+                    self.environment_status_label.configure(text=f"安装中：{str(payload)[:140]}")
+                elif kind == "environment-install-finished":
+                    self._environment_installing = False
+                    for key, page in self.page_widgets.items():
+                        if key != "tasks":
+                            self._set_widget_tree_state(page, False)
+                    for button in self.nav_buttons.values():
+                        button.configure(state="normal")
+                    code, cancelled, message = payload
+                    if cancelled:
+                        self.environment_status_label.configure(text="安装已取消；请重新检查环境状态。")
+                    elif code == 0:
+                        self._environment_restart_required = True
+                        if message:
+                            self.environment_status_label.configure(text=message)
+                        else:
+                            self.environment_status_label.configure(text="安装完成；正在重新检查，并提示重启程序。")
+                        self._start_environment_check()
+                    else:
+                        self.environment_status_label.configure(text=f"安装失败，pip 退出码 {code}；请查看安装输出。")
+                    self._refresh_environment_button_states()
+                    if self._environment_close_pending:
+                        self.destroy()
+                        return
+                elif kind == "environment-error":
+                    self._environment_checking = False
+                    self._environment_installing = False
+                    for key, page in self.page_widgets.items():
+                        if key != "tasks":
+                            self._set_widget_tree_state(page, False)
+                    for button in self.nav_buttons.values():
+                        button.configure(state="normal")
+                    self._environment_log.append(str(payload))
+                    self._environment_log = self._environment_log[-40:]
+                    self.environment_status_label.configure(text=f"操作未完成：{payload}")
+                    if self.environment_report is not None:
+                        details = format_environment_report(self.environment_report)
+                        self._set_readonly_text(self.environment_details, details + "\n\n错误：\n" + "\n".join(self._environment_log))
+                    self._refresh_environment_button_states()
+                    if self._environment_close_pending:
+                        self.destroy()
+                        return
+        except Empty:
+            pass
+        try:
+            if self.winfo_exists():
+                self.after(100, self._poll_environment_events)
+        except tk.TclError:
+            return
 
     def _fit_dialog(self, window: Any, width: int, height: int) -> None:
         """Cap popups to the active monitor work area after CTk scaling."""
@@ -787,7 +1137,7 @@ class SemanticApp(ctk.CTk):
         window.configure(fg_color=CANVAS)
         window.grid_rowconfigure(0, weight=1)
         window.grid_columnconfigure(0, weight=1)
-        text = tk.Text(window, wrap="word", bg=WHITE, fg=INK, relief="solid", bd=2,
+        text = tk.Text(window, wrap="word", bg=WHITE, fg=INK, relief="solid", bd=1,
                        font=("Microsoft YaHei UI", 11), padx=12, pady=10)
         yscroll = ttk.Scrollbar(window, orient="vertical", command=text.yview)
         text.configure(yscrollcommand=yscroll.set)
@@ -824,6 +1174,9 @@ class SemanticApp(ctk.CTk):
     def _settings_snapshot(self) -> dict[str, Any]:
         return {
             "method": next((key for key, label in METHODS.items() if label == self.method_var.get()), "bge"),
+            "parallel_enabled": bool(self.parallel_enabled_var.get()),
+            "cpu_workers": self.cpu_workers_var.get(),
+            "bge_device": self._selected_bge_device(),
             "segmentation": self.segmentation_var.get(), "stopwords": self.stopwords_var.get(),
             "custom_stopwords_path": self.custom_stopwords_var.get().strip(),
             "user_dictionary_path": self.user_dictionary_var.get().strip(),
@@ -850,6 +1203,10 @@ class SemanticApp(ctk.CTk):
         method = settings.get("method")
         if method in METHODS:
             self.method_var.set(METHODS[method])
+        self.parallel_enabled_var.set(bool(settings.get("parallel_enabled", False)))
+        self.cpu_workers_var.set(str(settings.get("cpu_workers", 4)))
+        self.bge_device_var.set(self.BGE_DEVICE_NAMES.get(str(settings.get("bge_device", "cpu")), "CPU"))
+        self._toggle_parallel_controls()
         for key, variable in [("segmentation", self.segmentation_var), ("stopwords", self.stopwords_var),
                               ("custom_stopwords_path", self.custom_stopwords_var), ("user_dictionary_path", self.user_dictionary_var),
                               ("word2vec_path", self.word2vec_path_var), ("max_features", self.max_features_var),
@@ -882,8 +1239,10 @@ class SemanticApp(ctk.CTk):
         self.selected_paths = paths
         existing = [path for path in paths if Path(path).exists()]
         if existing:
-            names = [Path(path).name for path in paths]
+            names = [Path(path).name for path in existing]
             self.files_label.configure(text="\n".join(names[:8]) + (f"\n… 共 {len(names)} 个来源" if len(names) > 8 else ""))
+        else:
+            self.files_label.configure(text="尚未选择文件。支持 TXT、CSV、TSV、XLSX、JSONL。")
         missing = [path for path in paths if not Path(path).exists()]
         missing.extend(path for path in [self.user_dictionary_var.get(), self.custom_stopwords_var.get(), self.word2vec_path_var.get()]
                        if path and not Path(path).exists())
@@ -924,6 +1283,135 @@ class SemanticApp(ctk.CTk):
         self.runtime.save_last_settings(self._settings_snapshot())
         self._set_status(f"已加载预设“{name}”。" + (f"\n资源缺失：{missing}" if missing else ""))
 
+    def _prompt_preset_name(self, names: list[str], title: str) -> str | None:
+        if not names:
+            return None
+        visible_names = names if len(names) <= 16 else [*names[:15], f"… 其余 {len(names) - 15} 个预设"]
+        choice = simpledialog.askstring(
+            title, "请输入要使用的预设名称（可从列表复制）：\n\n" + "\n".join(visible_names),
+            initialvalue=names[0], parent=self,
+        )
+        if choice is None:
+            return None
+        choice = choice.strip()
+        if choice not in names:
+            messagebox.showerror(title, f"找不到名为“{choice}”的预设。", parent=self)
+            return None
+        return choice
+
+    def _apply_external_settings(self, value: dict[str, Any]) -> str:
+        if self.busy:
+            raise ValueError("当前任务正在执行，暂时不能更改设置。")
+        settings = validate_settings(value)
+        previous = self._settings_snapshot()
+        try:
+            missing = self._apply_settings(settings)
+            self._config_from_ui()
+            self.runtime.save_last_settings(self._settings_snapshot())
+        except Exception:
+            self._apply_settings(previous)
+            raise
+        return missing
+
+    def _import_settings_clicked(self) -> None:
+        if self.busy:
+            messagebox.showinfo("任务正在执行", "任务完成后再导入设置。", parent=self)
+            return
+        chosen = filedialog.askopenfilename(parent=self, title="导入 PYsemantic 设置",
+                                            filetypes=[("JSON 设置", "*.json"), ("所有文件", "*.*")])
+        if not chosen:
+            return
+        try:
+            document = read_settings_file(chosen)
+            if "settings" in document:
+                settings = document["settings"]
+                source_name = "设置"
+            else:
+                presets = document["presets"]
+                names = sorted(presets)
+                name = names[0] if len(names) == 1 else self._prompt_preset_name(names, "选择要导入的预设")
+                if not name:
+                    return
+                settings = presets[name]
+                source_name = f"预设“{name}”"
+            missing = self._apply_external_settings(settings)
+        except Exception as exc:
+            messagebox.showerror("导入设置失败", str(exc), parent=self)
+            return
+        text = f"已导入{source_name}。输入路径仅已记录，没有读取文件。"
+        if missing:
+            text += f"\n以下资源当前不可用，请重新选择：\n{missing}"
+        self._set_status(text)
+
+    def _export_settings_clicked(self) -> None:
+        chosen = filedialog.asksaveasfilename(parent=self, title="导出 PYsemantic 设置",
+                                              defaultextension=".json", initialfile="pysemantic-settings.json",
+                                              filetypes=[("JSON 设置", "*.json")])
+        if not chosen:
+            return
+        try:
+            write_settings_file(chosen, settings_document(self._settings_snapshot()))
+        except Exception as exc:
+            messagebox.showerror("导出设置失败", str(exc), parent=self)
+            return
+        self._set_status(f"设置已导出：{chosen}")
+
+    def _import_preset_clicked(self) -> None:
+        if self.busy:
+            messagebox.showinfo("任务正在执行", "任务完成后再导入预设。", parent=self)
+            return
+        chosen = filedialog.askopenfilename(parent=self, title="导入 PYsemantic 参数预设",
+                                            filetypes=[("JSON 设置", "*.json"), ("所有文件", "*.*")])
+        if not chosen:
+            return
+        try:
+            document = read_settings_file(chosen)
+            presets = document.get("presets")
+            if presets:
+                names = sorted(presets)
+                source_name = names[0] if len(names) == 1 else self._prompt_preset_name(names, "选择要导入的预设")
+                if not source_name:
+                    return
+                settings = presets[source_name]
+                default_name = source_name
+            else:
+                settings = document["settings"]
+                default_name = Path(chosen).stem
+            name = simpledialog.askstring("保存导入预设", "输入在本机显示的预设名称：",
+                                          initialvalue=default_name[:80], parent=self)
+            if name is None:
+                return
+            name = name.strip()
+            if not name or len(name) > 80 or "\n" in name or "\r" in name:
+                raise ValueError("预设名称须为 1–80 个字符，且不能包含换行。")
+            settings = validate_settings(settings)
+            merged = self.runtime.presets()
+            merged[name] = settings
+            self.runtime.save_presets(merged)
+            self._refresh_preset_names()
+            self.preset_picker_var.set(name)
+        except Exception as exc:
+            messagebox.showerror("导入预设失败", str(exc), parent=self)
+            return
+        self._set_status(f"已导入参数预设“{name}”。预设不包含粘贴文本。")
+
+    def _export_presets_clicked(self) -> None:
+        presets = self.runtime.presets()
+        if not presets:
+            messagebox.showinfo("没有预设", "先保存至少一个命名预设，再导出。", parent=self)
+            return
+        chosen = filedialog.asksaveasfilename(parent=self, title="导出参数预设",
+                                              defaultextension=".json", initialfile="pysemantic-presets.json",
+                                              filetypes=[("JSON 设置", "*.json")])
+        if not chosen:
+            return
+        try:
+            write_settings_file(chosen, presets_document(presets))
+        except Exception as exc:
+            messagebox.showerror("导出预设失败", str(exc), parent=self)
+            return
+        self._set_status(f"已导出 {len(presets)} 个参数预设：{chosen}")
+
     def _delete_preset_clicked(self) -> None:
         name = self.preset_picker_var.get()
         if not name:
@@ -956,7 +1444,7 @@ class SemanticApp(ctk.CTk):
         filter_var = tk.StringVar(value="")
         self._label(top, "筛选").pack(side="left", padx=(0, 6))
         self._entry(top, filter_var, width=250, placeholder="任务 ID、阶段、警告或错误").pack(side="left", padx=(0, 8))
-        text = tk.Text(window, wrap="char", height=14, bg=WHITE, fg=INK, relief="solid", bd=2,
+        text = tk.Text(window, wrap="char", height=14, bg=WHITE, fg=INK, relief="solid", bd=1,
                        font=("Consolas", 10), padx=8, pady=7)
         yscroll = ttk.Scrollbar(window, orient="vertical", command=text.yview)
         text.configure(yscrollcommand=yscroll.set)
@@ -1524,6 +2012,9 @@ class SemanticApp(ctk.CTk):
                                   word2vec_tfidf_weight=self.word2vec_tfidf_var.get(),
                                   compute_similarity=self.similarity_var.get(),
                                   compute_clusters=self.compute_clusters_var.get(),
+                                  parallel_enabled=bool(self.parallel_enabled_var.get()),
+                                  cpu_workers=int(self.cpu_workers_var.get()),
+                                  bge_device=self._selected_bge_device(),
                                   case_mode=self.case_mode_var.get(),
                                   **{key: variable.get() for key, variable in self.extra_bool_vars.items()},
                                   **numeric).normalized()
@@ -1951,6 +2442,12 @@ class SemanticApp(ctk.CTk):
             self._set_status("正在取消；本任务后台进程结束后会停止并清理本任务暂存文件。")
 
     def _on_close(self) -> None:
+        if self._environment_installing:
+            self._environment_close_pending = True
+            self._environment_cancel_event.set()
+            self.environment_status_label.configure(text="正在取消 pip；结束后关闭窗口。")
+            self._refresh_environment_button_states()
+            return
         if not self.busy:
             self.destroy()
             return
@@ -1999,6 +2496,7 @@ class SemanticApp(ctk.CTk):
         for button in self.nav_buttons.values():
             button.configure(state="normal")
         self.cancel_button.configure(state="normal" if busy else "disabled")
+        self._refresh_environment_button_states()
         if busy:
             self.cancel_button.lift()
 
@@ -2127,7 +2625,7 @@ class SemanticApp(ctk.CTk):
         limit = min(len(result.doc_ids), 80)
         self._label(self.heatmap_frame, f"前 {limit} × {limit} 篇文档预览；导出可获得完整矩阵。格子颜色表示余弦相似度，坐标按当前文档顺序。",
                     font=SMALL_FONT, anchor="w", justify="left", wraplength=830).pack(fill="x", padx=8, pady=(8, 2))
-        host = ctk.CTkFrame(self.heatmap_frame, fg_color=WHITE, border_color=INK, border_width=1, corner_radius=8)
+        host = ctk.CTkFrame(self.heatmap_frame, fg_color=WHITE, border_color=LINE, border_width=1, corner_radius=8)
         host.pack(fill="both", expand=True, padx=8, pady=6)
         canvas = tk.Canvas(host, bg=WHITE, highlightthickness=0, width=840, height=540)
         yscroll = ttk.Scrollbar(host, orient="vertical", command=canvas.yview)

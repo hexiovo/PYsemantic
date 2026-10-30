@@ -5,3 +5,6 @@
 *.txt text eol=lf
 *.ps1 text eol=crlf
 *.ico binary
+*.png binary
+*.pdf binary
+*.cmd text eol=crlf

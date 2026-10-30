@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 from collections import Counter
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from time import monotonic
 from typing import Any, Callable
@@ -16,11 +16,13 @@ import jieba
 import numpy as np
 import pandas as pd
 from scipy import sparse
+from joblib import parallel_backend
 from sklearn.cluster import KMeans
 from sklearn.decomposition import LatentDirichletAllocation, NMF, TruncatedSVD
 from sklearn.feature_extraction.text import CountVectorizer, TfidfTransformer, TfidfVectorizer
 from sklearn.metrics import silhouette_score
 from sklearn.preprocessing import normalize
+from threadpoolctl import threadpool_limits
 
 from .data_io import Corpus
 from .resources import user_data_path
@@ -91,6 +93,9 @@ class AnalysisConfig:
     lda_evaluate_every: int = -1
     lda_doc_topic_prior: float | None = None
     lda_topic_word_prior: float | None = None
+    parallel_enabled: bool = False
+    cpu_workers: int = 4
+    bge_device: str = "cpu"
 
     def normalized(self) -> "AnalysisConfig":
         cfg = AnalysisConfig(**asdict(self))
@@ -125,9 +130,14 @@ class AnalysisConfig:
             if not isinstance(value, int) or isinstance(value, bool) or not low <= value <= high:
                 raise ValueError(f"{label}须为 {low}–{high} 范围内的整数。")
         for name in ["compute_clusters", "compute_neighbors", "compute_silhouette", "remove_numbers",
-                     "remove_urls", "tfidf_sublinear_tf", "tfidf_smooth_idf"]:
+                     "remove_urls", "tfidf_sublinear_tf", "tfidf_smooth_idf", "parallel_enabled"]:
             if not isinstance(getattr(cfg, name), bool):
                 raise ValueError(f"{name} 须为布尔值。")
+        if (not isinstance(cfg.cpu_workers, int) or isinstance(cfg.cpu_workers, bool)
+                or not 1 <= cfg.cpu_workers <= 32):
+            raise ValueError("CPU 工作线程数须为 1–32 的整数。")
+        if cfg.bge_device not in {"cpu", "auto", "cuda", "directml"}:
+            raise ValueError("BGE 设备须选择 cpu、auto、cuda 或 directml。")
         if cfg.case_mode not in {"方法默认", "统一小写", "保持原样"}:
             raise ValueError("英文大小写须选择方法默认、统一小写或保持原样。")
         for name, label in [("nmf_tol", "NMF 收敛阈值"), ("kmeans_tol", "KMeans 收敛阈值"),
@@ -311,18 +321,132 @@ def _bge_model_dir() -> Path:
     return resource_path("assets/bge-small-zh-v1.5")
 
 
+_BGE_PROVIDER_BY_DEVICE = {
+    "cuda": "CUDAExecutionProvider",
+    "directml": "DmlExecutionProvider",
+}
+
+
+def _create_bge_session(ort: Any, model_path: str | Path, cfg: AnalysisConfig) -> tuple[Any, dict[str, Any]]:
+    """Create a BGE session and verify the requested provider is active.
+
+    ONNX Runtime can keep a CPU provider in the session as a fallback for graph
+    nodes an accelerator cannot execute. The returned provider list therefore
+    describes session priority, not a guarantee that every graph operation is
+    running on the accelerator.
+    """
+    available = list(ort.get_available_providers())
+    requested = cfg.bge_device
+    cpu_provider = "CPUExecutionProvider"
+    fallback_reasons: list[str] = []
+
+    if requested == "cpu":
+        candidates = [cpu_provider]
+    elif requested == "auto":
+        candidates = [provider for provider in (
+            _BGE_PROVIDER_BY_DEVICE["cuda"], _BGE_PROVIDER_BY_DEVICE["directml"]
+        ) if provider in available]
+        if not candidates:
+            fallback_reasons.append("当前 ONNX Runtime 未提供 CUDA 或 DirectML execution provider")
+        candidates.append(cpu_provider)
+    else:
+        provider = _BGE_PROVIDER_BY_DEVICE[requested]
+        if provider not in available:
+            raise RuntimeError(
+                f"已选择 BGE {requested.upper()}，但当前 ONNX Runtime 未提供 {provider}。"
+                "请安装包含该 execution provider 的运行时并确认设备驱动可用。"
+            )
+        candidates = [provider]
+
+    for provider in candidates:
+        if provider not in available:
+            reason = f"{provider} 不在当前 ONNX Runtime 的可用 provider 列表中"
+            if requested == "auto":
+                fallback_reasons.append(reason)
+                continue
+            raise RuntimeError(reason)
+
+        session_options = ort.SessionOptions()
+        if cfg.parallel_enabled:
+            session_options.intra_op_num_threads = cfg.cpu_workers
+        if provider == _BGE_PROVIDER_BY_DEVICE["directml"]:
+            # DirectML requires sequential graph execution and disabled memory patterns.
+            session_options.enable_mem_pattern = False
+            session_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+
+        requested_providers = [provider]
+        if provider != cpu_provider and cpu_provider in available:
+            requested_providers.append(cpu_provider)
+        try:
+            session = ort.InferenceSession(
+                str(model_path), sess_options=session_options, providers=requested_providers
+            )
+            actual_providers = list(session.get_providers())
+        except Exception as exc:
+            if requested != "auto":
+                label = requested.upper()
+                raise RuntimeError(f"无法初始化明确选择的 BGE {label} execution provider：{exc}") from exc
+            fallback_reasons.append(f"{provider} 初始化失败（{type(exc).__name__}: {exc}）")
+            continue
+
+        # Provider order is significant: the first entry has highest priority.
+        # Explicit accelerator requests must not silently become CPU sessions.
+        if not actual_providers or actual_providers[0] != provider:
+            reason = f"请求 {provider}，会话实际 provider 顺序为 {actual_providers or '空'}"
+            if requested == "auto":
+                fallback_reasons.append(reason)
+                continue
+            raise RuntimeError(
+                f"已选择 BGE {requested.upper()}，但 ONNX Runtime 未将 {provider} 设为活动 provider；{reason}。"
+                "为避免静默回退，分析已停止。"
+            )
+
+        return session, {
+            "requested_device": requested,
+            "selected_provider": provider,
+            "active_providers": actual_providers,
+            "fallback_reason": "; ".join(fallback_reasons),
+        }
+
+    # Auto mode always tries CPU last. Reaching this branch means even CPU
+    # session creation failed; preserve the concrete initialization detail.
+    reason = "; ".join(fallback_reasons) or "没有可用 execution provider"
+    raise RuntimeError(f"BGE 自动设备选择失败：{reason}。")
+
+
 def _encode_bge(texts: list[str], progress: Callable[[float, str], None] | None, cancel_event: Any,
-                event_callback: Callable[[dict[str, Any]], None] | None = None) -> tuple[np.ndarray, int]:
+                event_callback: Callable[[dict[str, Any]], None] | None = None, *,
+                config: AnalysisConfig | None = None,
+                device_info: dict[str, Any] | None = None) -> tuple[np.ndarray, int]:
     with _stage(event_callback, "bge-model-load", "加载本地 BGE 模型", "bge"):
         import onnxruntime as ort
         from tokenizers import Tokenizer
 
+        # run_analysis passes its already-normalized config; keep the no-config
+        # private-call path compatible without repeating boundary validation.
+        cfg = config if config is not None else AnalysisConfig().normalized()
         model_dir = _bge_model_dir()
         model_path = model_dir / "onnx" / "model.onnx"
         tokenizer_path = model_dir / "tokenizer.json"
         if not model_path.is_file() or not tokenizer_path.is_file():
             raise FileNotFoundError("本地 BGE 模型资源缺失。请重新安装完整程序；分析过程不会联网下载模型。")
-        session = ort.InferenceSession(str(model_path), providers=["CPUExecutionProvider"])
+        session, selected_device = _create_bge_session(ort, model_path, cfg)
+        if device_info is not None:
+            device_info.update(selected_device)
+        if event_callback:
+            provider_summary = (
+                f"requested={selected_device['requested_device']}; "
+                f"selected={selected_device['selected_provider']}; "
+                f"active={','.join(selected_device['active_providers'])}"
+            )
+            event_callback({
+                "type": "stage-progress", "stage_id": "bge-model-load", "method": "bge",
+                "work_done": 1, "work_total": 1, "unit": "ONNX 会话",
+                "requested_device": selected_device["requested_device"],
+                "selected_provider": selected_device["selected_provider"],
+                "active_providers": selected_device["active_providers"],
+                "details": provider_summary,
+            })
         tokenizer = Tokenizer.from_file(str(tokenizer_path))
         tokenizer.no_truncation()
         input_meta = {item.name: item for item in session.get_inputs()}
@@ -645,6 +769,22 @@ def run_analysis(
     event_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> AnalysisResult:
     cfg = (config or AnalysisConfig()).normalized()
+    thread_context = threadpool_limits(limits=cfg.cpu_workers) if cfg.parallel_enabled else nullcontext()
+    with thread_context:
+        return _run_analysis_normalized(
+            corpus, cfg, cancel_event=cancel_event, progress=progress, event_callback=event_callback
+        )
+
+
+def _run_analysis_normalized(
+    corpus: Corpus,
+    config: AnalysisConfig,
+    *,
+    cancel_event: Any = None,
+    progress: Callable[[float, str], None] | None = None,
+    event_callback: Callable[[dict[str, Any]], None] | None = None,
+) -> AnalysisResult:
+    cfg = config
     docs = corpus.documents
     n_docs = len(docs)
     if n_docs > MAX_ANALYSIS_DOCS:
@@ -696,7 +836,22 @@ def run_analysis(
     matrix_name = ""
 
     if cfg.method == "bge":
-        doc_matrix, long_document_count = _encode_bge(analysis_texts, progress, cancel_event, event_callback)
+        device_info: dict[str, Any] = {}
+        doc_matrix, long_document_count = _encode_bge(
+            analysis_texts, progress, cancel_event, event_callback, config=cfg, device_info=device_info
+        )
+        selected_provider = device_info.get("selected_provider")
+        if selected_provider in {_BGE_PROVIDER_BY_DEVICE["cuda"], _BGE_PROVIDER_BY_DEVICE["directml"]}:
+            fallback_note = (
+                f"ONNX Runtime 会话 provider 顺序为 {' → '.join(device_info.get('active_providers', []))}。"
+                "不保证模型中的每个算子都由 GPU 执行，ONNX Runtime 仍可能将不支持的算子分配到 CPU。"
+            )
+            warnings.append(f"BGE GPU provider 已启用（{selected_provider}）；{fallback_note}")
+        elif cfg.bge_device == "auto":
+            reason = device_info.get("fallback_reason") or "未激活 GPU provider"
+            warnings.append(
+                f"BGE 设备设为自动选择，但本次使用 CPUExecutionProvider（{reason}）。"
+            )
         doc_features = [f"维度{i + 1}" for i in range(doc_matrix.shape[1])]
         matrix_name = "BGE CLS + L2 向量"
         if long_document_count:
@@ -746,9 +901,17 @@ def run_analysis(
             model = LatentDirichletAllocation(n_components=n_components, learning_method="batch", random_state=cfg.random_state,
                         max_iter=cfg.lda_max_iter, mean_change_tol=cfg.lda_mean_change_tol, perp_tol=cfg.lda_perp_tol,
                         evaluate_every=cfg.lda_evaluate_every, doc_topic_prior=cfg.lda_doc_topic_prior,
-                        topic_word_prior=cfg.lda_topic_word_prior)
+                        topic_word_prior=cfg.lda_topic_word_prior,
+                        n_jobs=cfg.cpu_workers if cfg.parallel_enabled else None)
             with _stage(event_callback, "lda-fit", "拟合 LDA 主题模型", cfg.method, work_total=1, unit="拟合"):
-                topic_doc = model.fit_transform(counts).astype(np.float32)
+                if cfg.parallel_enabled and cfg.cpu_workers > 1:
+                    # LDA's joblib work runs in threads so frozen Windows builds
+                    # do not need to spawn child processes. Keep native BLAS/OpenMP
+                    # work single-threaded inside those workers to avoid nested pools.
+                    with parallel_backend("threading", n_jobs=cfg.cpu_workers), threadpool_limits(limits=1):
+                        topic_doc = model.fit_transform(counts).astype(np.float32)
+                else:
+                    topic_doc = model.fit_transform(counts).astype(np.float32)
             components = model.components_ / np.maximum(model.components_.sum(axis=1, keepdims=True), 1e-20)
             topic_weight_kind = "LDA p(词语 | 主题)（逐主题归一化概率）"
             matrix_name = f"LDA 文档主题概率（{n_components} 个主题）"

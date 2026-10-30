@@ -1,0 +1,5 @@
+# Windows GPU overlay. Install requirements-lock.txt first, then uninstall
+# onnxruntime before installing this file (the distributions share one module).
+onnxruntime-directml==1.24.4
+sympy==1.14.0
+mpmath==1.3.0

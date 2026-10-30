@@ -376,7 +376,7 @@ class ResultsExplorer:
             metadata.grid(row=0, column=0, sticky="ew", pady=(0, 5))
             self.app._set_readonly_text(metadata, f"文档 ID：{doc_id}\n{source}")
             content = ctk.CTkTextbox(panel, fg_color=self.white, text_color=self.ink, font=self.font, wrap="word",
-                                     border_width=1, border_color=self.ink)
+                                     border_width=1, border_color="#D5DEE8")
             content.grid(row=1, column=0, sticky="nsew")
             self.app._set_readonly_text(content, doc.text if doc and doc.text else
                                        "原文不可用。\n\n历史结果缓存不保存原文。请打开包含语料文本的已保存项目，或重新导入原文并运行分析。")

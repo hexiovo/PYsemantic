@@ -148,6 +148,10 @@ def _new_kill_on_close_job(process_handle: int) -> int | None:
 
 def popen_owned_process(*args: Any, **kwargs: Any) -> subprocess.Popen:
     """Start a worker with an inherited Windows job, or fall back to tree-kill."""
+    inherited_environment = kwargs.get("env")
+    worker_environment = dict(os.environ if inherited_environment is None else inherited_environment)
+    worker_environment["PYINSTALLER_SUPPRESS_SPLASH_SCREEN"] = "1"
+    kwargs["env"] = worker_environment
     if os.name != "nt":
         return subprocess.Popen(*args, **kwargs)
     flags = int(kwargs.get("creationflags", 0))
@@ -486,7 +490,14 @@ class RuntimeStore:
             raise ValueError("预设名称不能为空。")
         values = self.presets()
         values[clean_name] = settings
-        self._atomic_json(self.presets_path, values)
+        self.save_presets(values)
+
+    def save_presets(self, presets: dict[str, dict[str, Any]]) -> None:
+        """Atomically replace the named preset collection after an import."""
+        if not isinstance(presets, dict) or any(not isinstance(name, str) or not isinstance(settings, dict)
+                                                for name, settings in presets.items()):
+            raise ValueError("预设必须是名称到设置对象的映射。")
+        self._atomic_json(self.presets_path, presets)
 
     def delete_preset(self, name: str) -> None:
         values = self.presets()

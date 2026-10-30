@@ -1,0 +1,3 @@
+# Optional tools for rebuilding docs/PYsemantic操作指南.pdf
+reportlab==5.1.0
+fonttools==4.67.0
